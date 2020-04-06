@@ -1,0 +1,210 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImagePalette
+
+
+class Pattern:
+    def __init__(self, data):
+        self.data = data
+        self.size = 0x2A8
+        self.offsets = (0x10, 0x38, 0x3C, 0x54, 0x58, 0x78, 0xA5)  # name, townID, town, playerID, player, palette, pattern
+        self.sizes = (40, 4, 20, 4, 20, 45, 0x400)
+        self.colours = 15
+        self.pattern_width = 32
+        self.pattern_height = 32
+        self.pattern_data = self.get_pattern_data()
+
+
+    @staticmethod
+    def strip_non_ascii(byte_array):
+        string = (chr(c) for c in byte_array if 32 <= c < 127)
+        return ''.join(string)
+
+    # bytearrays are immutable so we need to make a new one, inserts a given byte object into an offset position in data
+    # (refer to self.offsets). Allow a padding argument but try to be smart about how big our data is.
+    def set_data(self, byte_array, offset, pad=0):
+        # Set pad to whichever is largest, length of byte_array or pad, but do not exceed hardcoded size.
+        pad = min(max(len(byte_array), pad), self.sizes[offset])
+
+        # Data[0 to offset] + Padded byte_array + Data[offet + pad to end]
+        self.data = self.data[:self.offsets[offset]] + \
+                    bytes((list(byte_array) + [0] * pad)[:pad]) + \
+                    self.data[self.offsets[offset] + pad:self.size]
+
+    # Get ascii string for a given offset
+    def get_string(self, n):
+        #self.set_string('Change me', n)
+        string = self.strip_non_ascii(self.data[self.offsets[n]:self.offsets[n] + self.sizes[n]])
+        return string
+
+    # Pads a given string with 0x00 (NUL) characters between each char, passes to set_data to write to self.data
+    def set_string(self, string, n):
+        self.set_data(bytes(string.encode('utf-16le')), n)
+
+    def get_name(self):
+        return self.get_string(0)
+
+    def get_town_id(self):
+        return self.get_string(1)
+
+    def get_town(self):
+        return self.get_string(2)
+
+    def get_player_id(self):
+        return self.get_string(3)
+
+    def get_player(self):
+        return self.get_string(4)
+
+    # Palette in save data is 45 bytes long and represents 15 rgb colors, 3 bytes a piece
+    # Generate tuple of int (r,g,b) based on a given n (0>n>14)
+    def get_palette_color(self, n):
+        n = max(0,min(self.colours,n))
+        return list(map(int, [b for b in self.data[self.offsets[5] + n*3:self.offsets[5] + n*3 + 3]]))
+
+    # For each byte in the pattern section of data, swap nibbles. e.g 0xAC becomes 0xCA
+    # Then convert to a hex string so we can iterate later on.
+    def get_pattern_data(self):
+        return bytearray([((b & 0x0F) << 4 | (b & 0xF0) >> 4)
+                          for b in self.data[self.offsets[6]:self.offsets[6] + self.sizes[6]]]).hex()
+
+    # Expects a byte array where each byte contains two palette lookup values, swap each bytes nibbles then save to
+    # Our data
+    def set_pattern_data(self, hex_string, n):
+        self.set_data(bytes([((h & 0x0F) << 4 | (h & 0xF0) >> 4) for h in hex_string]), n)
+        self.pattern_data = self.get_pattern_data()
+
+    # Return a hex formatted rgb value (e.g #000000), tkinter does not understand the usual color tuples
+    # n should be 0 - 14 to pick one of the colors from the palette, 15 denotes transparency.
+    def get_tkinter_color(self, n):
+        return "#{0:02x}{1:02x}{2:02x}".format(*self.get_palette_color(n)) if (n <= 14) else ""
+
+    # Return a formatted color for a given x,y coordinate in the pattern_data
+    def get_pixel_color(self, x, y):
+        return self.get_tkinter_color(self.__get_pixel(x, y))
+
+    # Returns a nibble that represents one of our palette colours from position x,y
+    def __get_pixel(self, x, y):
+        return int(self.pattern_data[y * self.pattern_width + x], 16)
+
+    def export_to_png(self, path):
+        try:
+            # PIL doesn't seem to process palette data properly for a 4 bit data stream (parts of PIL expect 255 colors),
+            # so convert our pattern data to a list of full bytes (e.g 0xC becomes 0x0C)
+            image = Image.frombytes("P", (self.pattern_width, self.pattern_height),
+                                    bytes([(0x00 | int(b, 16)) for b in self.pattern_data]))
+            # Get each color from our palette, then flatten list of tuples into just a list of int
+            image.putpalette([c for n in range(15) for c in self.get_palette_color(n)])
+            # We have a PIL.image representation of our pattern now, however we want to convert our Palette image to RGB
+            # This is so external image editors don't constrain selectable colours to only those in our palette.
+            image = image.convert(mode="RGB")
+            # Save to disk
+            image.save(path)
+            return True
+        except:
+            return False
+
+    def import_from_png(self, path):
+        image = Image.open(path)
+
+        # Make sure we are the correct size before rewriting data
+        if image.width != 32 or image.height != 32:
+            return False
+
+        # Convert our RGB image (back) to a palette image  (handles re-mapping all colours to image.palette)
+        image = image.convert('P', palette=Image.ADAPTIVE, colors=15)
+        # Rewrite palette section of data with our palette, we can only set the first 15 colours due to expected format.
+        self.set_data(image.getpalette(), 5)
+
+        # Rewrite our pattern data string with the image bytes, taking lower nibble of each byte then casting to bytes,
+        # (e.g 0x0C,0x0E would become 0xCE)
+        self.set_pattern_data(bytes.fromhex(image.tobytes().hex()[1::2]), 6)
+
+        return True
+
+
+def save_png(pattern):
+    # Prompt user for
+    window.filename = filedialog.asksaveasfilename(filetypes=(("PNG image", "*.png"),),
+                                                   initialfile='{0}.png'.format(pattern.get_name()))
+    # Check we received a filename from the dialog
+    if not window.filename:
+        return
+
+    pattern.export_to_png(window.filename)
+
+
+def load_png(pattern, pixel_size):
+    window.filename = filedialog.askopenfilename(filetypes=(("new horizons data", "*.png"),),)
+
+    # Check we received a filename from the dialog
+    if not window.filename:
+        return
+
+    # Try to load the window.filename
+    if pattern.import_from_png(window.filename):
+        # Redraw palette array
+        draw_palette(pattern, pixel_size)
+        # Redraw pattern array
+        draw_pattern_array(pattern, pixel_size)
+    else:
+        # Parsing the provided file failed, spit out an error
+        messagebox.showerror("File load error", "Wrong image size or type")
+
+
+def save_pattern(pattern):
+    window.filename = filedialog.asksaveasfilename(filetypes=(("New horizons data", "*.nhd"),),
+                                                   initialfile='{0}.nhd'.format(pattern.get_name()))
+    with open(window.filename, mode='w+b') as f:
+        f.write(pattern.data)
+
+# Draw a 2d array of pixels using a given patterns palette and data
+def draw_pattern_array(pattern, pixel_size):
+    pattern_canvas.delete("all")
+    for y in range(pattern.pattern_height):
+        for x in range(pattern.pattern_width):
+            pattern_canvas.create_rectangle(x * pixel_size, y * pixel_size, x * pixel_size + pixel_size,
+                                            y * pixel_size + pixel_size, fill=pattern.get_pixel_color(x, y), width=0)
+
+# Draw a row of colours that represent our palette
+def draw_palette(pattern, pixel_size):
+    for n in range(pattern.colours):
+        palette_canvas.create_rectangle(n * pixel_size, 0, n * pixel_size + pixel_size, pixel_size + pixel_size,
+                                        fill=pattern.get_tkinter_color(n), width=0)
+
+
+pixel_size = 8
+window = tk.Tk()
+window.filename = filedialog.askopenfilename(title="Select pattern file",
+                                             filetypes=(("new horizons data", "*.nhd"),))
+
+with open(window.filename, mode='r+b') as f:
+    save_data = f.read()
+
+if not save_data:
+    print("File looks empty")
+    exit(1)
+
+pattern = Pattern(save_data)
+name = tk.Label(text=pattern.get_name())
+town = tk.Label(text="{0}".format(pattern.get_town()))
+creator = tk.Label(text="{0}".format(pattern.get_player()))
+
+# print(hex(pattern._Pattern__get_pixel(0, 0)))
+palette_canvas = tk.Canvas(width=15 * pixel_size, height=pixel_size)
+pattern_canvas = tk.Canvas(width=pattern.pattern_width * pixel_size, height=pattern.pattern_height * pixel_size)
+
+draw_palette(pattern,pixel_size)
+draw_pattern_array(pattern,pixel_size)
+export_button = tk.Button(text="Export PNG...", command=lambda : save_png(pattern))
+import_button = tk.Button(text="Import PNG...", command=lambda : load_png(pattern, pixel_size))
+save_button = tk.Button(text="Save Pattern...", command=lambda : save_pattern(pattern))
+palette_canvas.pack()
+pattern_canvas.pack()
+name.pack()
+town.pack()
+creator.pack()
+export_button.pack()
+import_button.pack()
+save_button.pack()
+window.mainloop()
