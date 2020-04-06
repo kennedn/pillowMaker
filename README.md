@@ -21,7 +21,7 @@ python3 -m pip install PIL tkinter
 ```
 Once the dependancies have been met the program can be run as follows:
 ```bash
-python3 main.py
+python3 pillowMaker
 ```
 
 Python is cross platform and this should work on windows.
